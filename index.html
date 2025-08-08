@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>PhotoShare — P2P via WebRTC + Firestore</title>
+<style>
+  body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;max-width:900px;margin:18px auto;padding:12px}
+  h1{font-size:1.2rem}
+  #controls{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  button,input,select{padding:8px;border-radius:6px;border:1px solid #ccc}
+  #images img{max-width:100%;margin:10px 0;border-radius:8px;display:block}
+  #logs{white-space:pre-wrap;background:#f7f7f7;padding:8px;border-radius:6px;font-size:0.9rem;max-height:200px;overflow:auto}
+  small{color:#666}
+</style>
+</head>
+<body>
+  <h1>PhotoShare — P2P (WebRTC) using Firestore for signaling</h1>
+
+  <div id="controls">
+    <button id="createBtn">Create Room</button>
+    <input id="roomIdInput" placeholder="Room ID (or leave empty)" />
+    <button id="joinBtn">Join Room</button>
+    <button id="copyLinkBtn" title="Copy open URL">Copy Room URL</button>
+    <label style="display:flex;align-items:center;gap:8px">
+      <input id="fileInput" type="file" accept="image/*" />
+      <span><small>Pick photo</small></span>
+    </label>
+  </div>
+
+  <div>
+    <strong>Status:</strong> <span id="status">idle</span>
+  </div>
+
+  <h3>Received photos</h3>
+  <div id="images"></div>
+
+  <h3>Logs</h3>
+  <div id="logs"></div>
+
+  <!-- Firebase SDK (modular) -->
+  <script type="module">
+  // ----- REPLACE with your Firebase project's config -----
+  const firebaseConfig = {
+    apiKey: "AIzaSyB1jtsr01tZaIlg-vdQ1etLB7QcSK3t4Bo",
+    authDomain: "file-share-p2p.firebaseapp.com",
+    projectId: "file-share-p2p",
+    storageBucket: "file-share-p2p.firebasestorage.app",
+    messagingSenderId: "35550590499",
+    appId: "1:35550590499:web:796981c7b0de03bcc02396",
+    measurementId: "G-534HD483S5"
+  };
+  // -------------------------------------------------------
+
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import {
+    getFirestore, collection, doc, setDoc, addDoc, getDoc,
+    onSnapshot, updateDoc, deleteDoc
+  } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+  const app = initializeApp(firebaseConfig);
+  const db = getFirestore(app);
+
+  // Small UI helpers
+  const $ = sel => document.querySelector(sel);
+  const log = (s) => {
+    const el = $('#logs');
+    el.textContent += s + '\n';
+    el.scrollTop = el.scrollHeight;
+  };
+  const setStatus = s => { $('#status').textContent = s; log('[status] '+s); };
+
+  // WebRTC variables
+  let pc = null;
+  let dataChannel = null;
+  let roomRef = null;
+  let roomId = null;
+
+  // Data transfer settings
+  const CHUNK_SIZE = 64 * 1024; // 64KB
+
+  // Build UI behavior
+  $('#createBtn').onclick = createRoom;
+  $('#joinBtn').onclick = joinRoom;
+  $('#copyLinkBtn').onclick = copyRoomUrl;
+  $('#fileInput').onchange = sendFile;
+
+  // Use Google's public STUN server; you may add TURN servers if needed.
+  const rtcConfig = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+  // Utility: create and wire a PeerConnection
+  function preparePeerConnection() {
+    pc = new RTCPeerConnection(rtcConfig);
+    pc.onicecandidate = e => {
+      if (!e.candidate || !roomRef) return;
+      // add candidate to appropriate subcollection depending on role
+      const role = (isCreator) ? 'callerCandidates' : 'calleeCandidates';
+      addDoc(collection(roomRef, role), e.candidate.toJSON()).catch(err => log('ICE add err: '+err));
+    };
+
+    // For the joining peer: handle incoming datachannel
+    pc.ondatachannel = event => {
+      dataChannel = event.channel;
+      wireDataChannel();
+    };
+  }
+
+  // Wire dataChannel events and set binaryType
+  function wireDataChannel() {
+    dataChannel.binaryType = 'arraybuffer';
+    dataChannel.onopen = () => { setStatus('DataChannel open'); log('DataChannel open'); };
+    dataChannel.onclose = () => { setStatus('DataChannel closed'); log('DataChannel closed'); };
+    dataChannel.onerror = e => log('DataChannel error: '+JSON.stringify(e));
+    // For chunk reassembly
+    let incoming = null;
+    let incomingMeta = null;
+    dataChannel.onmessage = e => {
+      if (typeof e.data === 'string') {
+        // control JSON (start / end / info)
+        try {
+          const obj = JSON.parse(e.data);
+          if (obj.type === 'meta') {
+            incomingMeta = obj.meta; // {name, mime, size, parts}
+            incoming = []; // will collect ArrayBuffers
+            log('Receiving: ' + incomingMeta.name + ' size ' + incomingMeta.size);
+          } else if (obj.type === 'done') {
+            // reassemble
+            const total = incomingMeta.size;
+            let receivedLen = incoming.reduce((a,b)=>a+b.byteLength,0);
+            log(`All chunks received: ${receivedLen}/${total}`);
+            // concat
+            const tmp = new Uint8Array(receivedLen);
+            let offset = 0;
+            incoming.forEach(buf => { tmp.set(new Uint8Array(buf), offset); offset += buf.byteLength; });
+            const blob = new Blob([tmp], { type: incomingMeta.mime });
+            displayImageBlob(blob);
+            incoming = null; incomingMeta = null;
+          }
+        } catch (err) { log('JSON parse err: '+err); }
+      } else { // ArrayBuffer chunk
+        if (incoming) incoming.push(e.data);
+      }
+    };
+  }
+
+  // Show image in UI
+  function displayImageBlob(blob) {
+    const url = URL.createObjectURL(blob);
+    const img = document.createElement('img');
+    img.src = url;
+    img.onload = () => URL.revokeObjectURL(url);
+    $('#images').prepend(img);
+  }
+
+  // Send file via chunked DataChannel
+  async function sendFile(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    if (!dataChannel || dataChannel.readyState !== 'open') {
+      alert('Data channel not open yet. Wait for connection.');
+      return;
+    }
+
+    setStatus('Sending ' + file.name);
+    log('Sending file: ' + file.name + ' ('+file.size+' bytes)');
+
+    // send metadata first
+    dataChannel.send(JSON.stringify({ type: 'meta', meta: { name: file.name, mime: file.type, size: file.size } }));
+
+    // read and send in chunks
+    const reader = file.stream().getReader();
+    let sent = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      // value is a Uint8Array chunk
+      // DataChannel can send ArrayBuffer directly
+      dataChannel.send(value.buffer);
+      sent += value.byteLength;
+      // optional: throttle if buffer grows
+      if (dataChannel.bufferedAmount > 4 * CHUNK_SIZE) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      log(`Sent ${sent}/${file.size}`);
+    }
+
+    // tell peer finished
+    dataChannel.send(JSON.stringify({ type: 'done' }));
+    setStatus('Sent ' + file.name);
+    log('Send complete');
+  }
+
+  // Utilities to create/join rooms using Firestore for signaling
+  let isCreator = false;
+
+  async function createRoom() {
+    isCreator = true;
+    preparePeerConnection();
+
+    // create data channel for the caller
+    dataChannel = pc.createDataChannel('photos');
+    wireDataChannel();
+
+    setStatus('Creating room...');
+    // make offer
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    // create room doc
+    roomRef = await addDoc(collection(db, 'rooms'), {
+      offer: { type: offer.type, sdp: offer.sdp },
+      createdAt: Date.now()
+    });
+    roomId = roomRef.id;
+    $('#roomIdInput').value = roomId;
+    setStatus('Room created: ' + roomId);
+    log('Room created: ' + roomId);
+
+    // listen for answer
+    onSnapshot(roomRef, async snap => {
+      const data = snap.data();
+      if (!pc.currentRemoteDescription && data && data.answer) {
+        const answer = data.answer;
+        await pc.setRemoteDescription(answer);
+        log('Remote answer set');
+      }
+    });
+
+    // handle callee ICE candidates
+    onSnapshot(collection(roomRef, 'calleeCandidates'), snapshot => {
+      snapshot.docChanges().forEach(change => {
+        if (change.type === 'added') {
+          const cand = change.doc.data();
+          pc.addIceCandidate(cand).catch(err=>log('addIceCandidate err: '+err));
+        }
+      });
+    });
+
+    setStatus('Waiting for peer to join. Share room ID.');
+  }
+
+  async function joinRoom() {
+    isCreator = false;
+    preparePeerConnection();
+
+    roomId = $('#roomIdInput').value.trim();
+    if (!roomId) {
+      alert('Enter room ID to join');
+      return;
+    }
+    roomRef = doc(collection(db, 'rooms'), roomId);
+    const roomSnap = await getDoc(roomRef);
+    if (!roomSnap.exists()) {
+      alert('Room not found');
+      return;
+    }
+    const roomData = roomSnap.data();
+    setStatus('Joining room ' + roomId);
+    log('Joining room ' + roomId);
+
+    // set remote description from offer
+    await pc.setRemoteDescription(roomData.offer);
+
+    // create answer
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+
+    // write answer back
+    await updateDoc(roomRef, { answer: { type: answer.type, sdp: answer.sdp } });
+
+    // listen for caller ICE candidates
+    onSnapshot(collection(roomRef, 'callerCandidates'), snapshot => {
+      snapshot.docChanges().forEach(change => {
+        if (change.type === 'added') {
+          const cand = change.doc.data();
+          pc.addIceCandidate(cand).catch(err=>log('addIceCandidate err: '+err));
+        }
+      });
+    });
+
+    // add our ICE candidates to calleeCandidates
+    pc.onicecandidate = e => {
+      if (e.candidate) {
+        addDoc(collection(roomRef, 'calleeCandidates'), e.candidate.toJSON()).catch(err=>log('ICE err: '+err));
+      }
+    };
+
+    // When the creator has a datachannel, wire it in ondatachannel handler (preparePeerConnection set it up)
+    setStatus('Joined room. Waiting DataChannel...');
+  }
+
+  function copyRoomUrl() {
+    if (!roomId) { alert('No room created/joined yet.'); return; }
+    // create a simple sharable URL (assumes hosting at root)
+    const url = `${location.origin}${location.pathname}?room=${roomId}`;
+    navigator.clipboard.writeText(url).then(()=>alert('Copied URL: '+url)).catch(()=>alert('Copy failed. Room ID: '+roomId));
+  }
+
+  // Auto-fill room input from URL param if present
+  (function parseUrl() {
+    const params = new URLSearchParams(location.search);
+    const r = params.get('room');
+    if (r) $('#roomIdInput').value = r;
+  })();
+
+  // Clean-up helper (optional)
+  window.addEventListener('beforeunload', async () => {
+    try {
+      if (roomRef && isCreator) {
+        // remove room doc and subcollections (best-effort)
+        // Note: Firestore doesn't allow deleting subcollections directly here; keep simple.
+        await deleteDoc(roomRef);
+      }
+    } catch (e) { /* ignore */ }
+  });
+  </script>
+</body>
+</html>
