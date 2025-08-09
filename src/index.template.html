@@ -82,10 +82,10 @@
 
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-app.js";
-  import {
-    getFirestore, collection, doc, setDoc, addDoc, getDoc,
-    onSnapshot, updateDoc, deleteDoc
-  } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-firestore.js";
+    import {
+      getFirestore, collection, doc, setDoc, addDoc, getDoc,
+      onSnapshot, updateDoc, deleteDoc
+    } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-firestore.js";
 
     // Firebase config injected at build time
     const firebaseConfig = {
@@ -177,52 +177,58 @@
             }
           } catch (err) { log('JSON parse err: ' + err); }
         } else { // ArrayBuffer chunk
-          if (incoming) incoming.push(e.data);
+          if (incoming) {
+            incoming.push(e.data);
+            if (incomingMeta) {
+              const total = incoming.reduce((a, b) => a + b.byteLength, 0);
+              log(`Received ${total}/${incomingMeta.size}`);
+            }
+          }
         }
       };
     }
 
     function displayImageBlob(blob) {
-  const url = URL.createObjectURL(blob);
+      const url = URL.createObjectURL(blob);
 
-  // Container for each received file
-  const container = document.createElement('div');
-  container.style.marginBottom = '12px';
+      // Container for each received file
+      const container = document.createElement('div');
+      container.style.marginBottom = '12px';
 
-  // File name label
-  const nameEl = document.createElement('div');
-  nameEl.textContent = incomingMeta?.name || 'received_file';
-  nameEl.style.fontWeight = 'bold';
-  nameEl.style.marginBottom = '4px';
-  container.appendChild(nameEl);
+      // File name label
+      const nameEl = document.createElement('div');
+      nameEl.textContent = incomingMeta?.name || 'received_file';
+      nameEl.style.fontWeight = 'bold';
+      nameEl.style.marginBottom = '4px';
+      container.appendChild(nameEl);
 
-  // Image preview
-  const img = document.createElement('img');
-  img.src = url;
-  img.style.maxWidth = '100%';
-  img.style.borderRadius = '8px';
-  img.onload = () => URL.revokeObjectURL(url);
-  container.appendChild(img);
+      // Image preview
+      const img = document.createElement('img');
+      img.src = url;
+      img.style.maxWidth = '100%';
+      img.style.borderRadius = '8px';
+      img.onload = () => URL.revokeObjectURL(url);
+      container.appendChild(img);
 
-  // Download button
-  const downloadBtn = document.createElement('a');
-  downloadBtn.href = url;
-  downloadBtn.download = incomingMeta?.name || 'photo.jpg';
-  downloadBtn.textContent = 'Download';
-  downloadBtn.style.display = 'inline-block';
-  downloadBtn.style.marginTop = '4px';
-  downloadBtn.style.padding = '6px 12px';
-  downloadBtn.style.background = '#007bff';
-  downloadBtn.style.color = '#fff';
-  downloadBtn.style.borderRadius = '4px';
-  downloadBtn.style.textDecoration = 'none';
-  downloadBtn.style.fontSize = '0.9rem';
+      // Download button
+      const downloadBtn = document.createElement('a');
+      downloadBtn.href = url;
+      downloadBtn.download = incomingMeta?.name || 'photo.jpg';
+      downloadBtn.textContent = 'Download';
+      downloadBtn.style.display = 'inline-block';
+      downloadBtn.style.marginTop = '4px';
+      downloadBtn.style.padding = '6px 12px';
+      downloadBtn.style.background = '#007bff';
+      downloadBtn.style.color = '#fff';
+      downloadBtn.style.borderRadius = '4px';
+      downloadBtn.style.textDecoration = 'none';
+      downloadBtn.style.fontSize = '0.9rem';
 
-  // On iOS Safari, tapping this link will show "Download" or "Save to Files"
-  container.appendChild(downloadBtn);
+      // On iOS Safari, tapping this link will show "Download" or "Save to Files"
+      container.appendChild(downloadBtn);
 
-  $('#images').prepend(container);
-}
+      $('#images').prepend(container);
+    }
 
     // Send file via chunked DataChannel
     async function sendFile(e) {
@@ -250,8 +256,8 @@
         dataChannel.send(value.buffer);
         sent += value.byteLength;
         // optional: throttle if buffer grows
-        if (dataChannel.bufferedAmount > 4 * CHUNK_SIZE) {
-          await new Promise(resolve => setTimeout(resolve, 50));
+        if (dataChannel.bufferedAmount > 2 * CHUNK_SIZE) {
+          await new Promise(resolve => setTimeout(resolve, 200));
         }
         log(`Sent ${sent}/${file.size}`);
       }
